@@ -28,6 +28,11 @@ var userCountry;
 var seekTimer;
 var restartTimeout;
 var wsConnectionStatus = 'started';
+var wsReconnectAttempts = 0;
+var wsMaxReconnectAttempts = 10;
+var wsPingInterval;
+var wsPingTimeout;
+var wsHealthCheckInterval;
 
 // State management
 var ws;
@@ -163,23 +168,53 @@ ControllerSpotify.prototype.goLibrespotDaemonWsConnection = function (action) {
 
     if (action === 'start') {
         wsConnectionStatus = 'started';
+        wsReconnectAttempts = 0;
         self.initializeWsConnection();
     } else if (action === 'stop') {
-        if (ws) {
-            ws.terminate();
-            ws = undefined;
-        }
+        self.cleanupWsConnection();
         wsConnectionStatus = 'stopped';
     } else if (action === 'restart'){
         if (wsConnectionStatus === 'started') {
             if (restartTimeout) {
                 clearTimeout(restartTimeout);
             }
+            // Exponential backoff: min(3 * 2^attempts, 60) seconds
+            var delay = Math.min(3000 * Math.pow(2, wsReconnectAttempts), 60000);
+            self.logger.info('Reconnecting to WebSocket in ' + (delay/1000) + ' seconds (attempt ' + (wsReconnectAttempts + 1) + '/' + wsMaxReconnectAttempts + ')');
+
             restartTimeout = setTimeout(()=>{
-                self.initializeWsConnection();
+                wsReconnectAttempts++;
+                if (wsReconnectAttempts >= wsMaxReconnectAttempts) {
+                    self.logger.error('Max WebSocket reconnection attempts reached. Restarting go-librespot daemon...');
+                    self.restartDaemon();
+                    wsReconnectAttempts = 0;
+                } else {
+                    self.initializeWsConnection();
+                }
                 restartTimeout = undefined;
-            }, 3000);
+            }, delay);
         }
+    }
+};
+
+ControllerSpotify.prototype.cleanupWsConnection = function () {
+    var self = this;
+
+    if (wsPingInterval) {
+        clearInterval(wsPingInterval);
+        wsPingInterval = undefined;
+    }
+    if (wsPingTimeout) {
+        clearTimeout(wsPingTimeout);
+        wsPingTimeout = undefined;
+    }
+    if (wsHealthCheckInterval) {
+        clearInterval(wsHealthCheckInterval);
+        wsHealthCheckInterval = undefined;
+    }
+    if (ws) {
+        ws.terminate();
+        ws = undefined;
     }
 };
 
@@ -187,10 +222,13 @@ ControllerSpotify.prototype.initializeWsConnection = function () {
     var self = this;
 
     self.logger.info('Initializing connection to go-librespot Websocket');
+    self.cleanupWsConnection();
 
     ws = new websocket('ws://localhost:' + spotifyDaemonPort + '/events');
+
     ws.on('error', function(error){
-        self.logger.info('Error connecting to go-librespot Websocket: ' + error);
+        self.logger.error('Error connecting to go-librespot Websocket: ' + error);
+        self.cleanupWsConnection();
         self.goLibrespotDaemonWsConnection('restart');
     });
 
@@ -199,13 +237,45 @@ ControllerSpotify.prototype.initializeWsConnection = function () {
         self.parseEventState(JSON.parse(data));
     });
 
+    ws.on('pong', function() {
+        self.debugLog('WebSocket pong received');
+        if (wsPingTimeout) {
+            clearTimeout(wsPingTimeout);
+            wsPingTimeout = undefined;
+        }
+    });
+
     ws.on('open', function () {
         self.logger.info('Connection to go-librespot Websocket established');
+        wsReconnectAttempts = 0; // Reset reconnect counter on successful connection
+
+        // Start ping/pong keepalive (every 30 seconds)
+        wsPingInterval = setInterval(function() {
+            if (ws && ws.readyState === websocket.OPEN) {
+                self.debugLog('Sending WebSocket ping');
+                ws.ping();
+
+                // Set timeout for pong response (5 seconds)
+                wsPingTimeout = setTimeout(function() {
+                    self.logger.error('WebSocket ping timeout - connection dead');
+                    self.cleanupWsConnection();
+                    self.goLibrespotDaemonWsConnection('restart');
+                }, 5000);
+            }
+        }, 30000);
+
+        // Start health check (every 60 seconds)
+        wsHealthCheckInterval = setInterval(function() {
+            self.checkDaemonHealth();
+        }, 60000);
+
         setTimeout(()=>{
             self.initializeSpotifyControls();
         }, 3000);
+
         ws.on('close', function(){
             self.logger.info('Connection to go-librespot Websocket closed');
+            self.cleanupWsConnection();
             self.goLibrespotDaemonWsConnection('restart');
         });
     });
@@ -439,26 +509,64 @@ ControllerSpotify.prototype.pushState = function (state) {
     return self.commandRouter.servicePushState(self.state, 'spop');
 };
 
-ControllerSpotify.prototype.sendSpotifyLocalApiCommand = function (commandPath) {
-    this.logger.info('Sending Spotify command to local API: ' + commandPath);
+ControllerSpotify.prototype.sendSpotifyLocalApiCommand = function (commandPath, retryCount) {
+    var self = this;
+    retryCount = retryCount || 0;
+    var maxRetries = 3;
+
+    self.logger.info('Sending Spotify command to local API: ' + commandPath);
 
     superagent.post(spotifyLocalApiEndpointBase + commandPath)
         .accept('application/json')
-        .then((results) => {})
+        .timeout(10000) // 10 second timeout
+        .then((results) => {
+            self.debugLog('Command succeeded: ' + commandPath);
+        })
         .catch((error) => {
-            this.logger.error('Failed to send command to Spotify local API: ' + commandPath  + ': ' + error);
+            self.logger.error('Failed to send command to Spotify local API: ' + commandPath + ' (attempt ' + (retryCount + 1) + '/' + maxRetries + '): ' + error);
+
+            // Retry with exponential backoff if not max retries
+            if (retryCount < maxRetries) {
+                var delay = Math.pow(2, retryCount) * 1000; // 1s, 2s, 4s
+                self.logger.info('Retrying command in ' + delay + 'ms...');
+                setTimeout(() => {
+                    self.sendSpotifyLocalApiCommand(commandPath, retryCount + 1);
+                }, delay);
+            } else {
+                self.logger.error('Max retries reached for command: ' + commandPath + '. Checking daemon health...');
+                self.checkDaemonHealth();
+            }
         });
 };
 
-ControllerSpotify.prototype.sendSpotifyLocalApiCommandWithPayload = function (commandPath, payload) {
-    this.logger.info('Sending Spotify command with payload to local API: ' + commandPath);
+ControllerSpotify.prototype.sendSpotifyLocalApiCommandWithPayload = function (commandPath, payload, retryCount) {
+    var self = this;
+    retryCount = retryCount || 0;
+    var maxRetries = 3;
+
+    self.logger.info('Sending Spotify command with payload to local API: ' + commandPath);
 
     superagent.post(spotifyLocalApiEndpointBase + commandPath)
         .accept('application/json')
         .send(payload)
-        .then((results) => {})
+        .timeout(10000) // 10 second timeout
+        .then((results) => {
+            self.debugLog('Command with payload succeeded: ' + commandPath);
+        })
         .catch((error) => {
-            this.logger.error('Failed to send command to Spotify local API: ' + commandPath  + ': ' + error);
+            self.logger.error('Failed to send command with payload to Spotify local API: ' + commandPath + ' (attempt ' + (retryCount + 1) + '/' + maxRetries + '): ' + error);
+
+            // Retry with exponential backoff if not max retries
+            if (retryCount < maxRetries) {
+                var delay = Math.pow(2, retryCount) * 1000; // 1s, 2s, 4s
+                self.logger.info('Retrying command with payload in ' + delay + 'ms...');
+                setTimeout(() => {
+                    self.sendSpotifyLocalApiCommandWithPayload(commandPath, payload, retryCount + 1);
+                }, delay);
+            } else {
+                self.logger.error('Max retries reached for command with payload: ' + commandPath + '. Checking daemon health...');
+                self.checkDaemonHealth();
+            }
         });
 };
 
@@ -726,6 +834,43 @@ ControllerSpotify.prototype.stopLibrespotDaemon = function () {
     return defer.promise;
 };
 
+ControllerSpotify.prototype.restartDaemon = function () {
+    var self = this;
+
+    self.logger.info('Restarting go-librespot daemon due to connection issues');
+    self.stopLibrespotDaemon()
+        .then(function() {
+            return self.startLibrespotDaemon();
+        })
+        .then(function() {
+            self.logger.info('Go-librespot daemon restarted successfully');
+        })
+        .catch(function(error) {
+            self.logger.error('Failed to restart go-librespot daemon: ' + error);
+        });
+};
+
+ControllerSpotify.prototype.checkDaemonHealth = function () {
+    var self = this;
+
+    // Check if daemon is responsive by querying the status endpoint
+    superagent.get(spotifyLocalApiEndpointBase + '/status')
+        .accept('application/json')
+        .timeout(5000)
+        .then((results) => {
+            self.debugLog('Daemon health check passed');
+        })
+        .catch((error) => {
+            self.logger.error('Daemon health check failed: ' + error);
+            // If health check fails, try to reconnect WebSocket
+            if (wsConnectionStatus === 'started') {
+                self.logger.info('Attempting to reconnect WebSocket after failed health check');
+                self.cleanupWsConnection();
+                self.goLibrespotDaemonWsConnection('restart');
+            }
+        });
+};
+
 
 ControllerSpotify.prototype.createConfigFile = function () {
     var self = this;
@@ -858,16 +1003,20 @@ ControllerSpotify.prototype.refreshAccessToken = function () {
     if (refreshToken !== 'none' && refreshToken !== null && refreshToken !== undefined) {
         superagent.post('https://oauth-performer.prod.vlmapi.io/spotify/accessToken')
             .send({refreshToken: refreshToken})
+            .timeout(10000) // 10 second timeout
             .then(function (results) {
                 if (results && results.body && results.body.accessToken) {
                     defer.resolve(results)
                 } else {
-                    defer.resject('No access token received');
+                    defer.reject('No access token received');
                 }
             })
             .catch(function (err) {
-                self.logger.info('An error occurred while refreshing Spotify Token ' + err);
+                self.logger.error('An error occurred while refreshing Spotify Token: ' + err);
+                defer.reject(err);
             });
+    } else {
+        defer.reject('No refresh token available');
     }
 
     return defer.promise;
