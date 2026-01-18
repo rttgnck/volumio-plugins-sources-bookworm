@@ -33,6 +33,8 @@ var wsMaxReconnectAttempts = 10;
 var wsPingInterval;
 var wsPingTimeout;
 var wsHealthCheckInterval;
+var hasShownConnectionError = false;
+var hasShownDaemonError = false;
 
 // State management
 var ws;
@@ -182,10 +184,19 @@ ControllerSpotify.prototype.goLibrespotDaemonWsConnection = function (action) {
             var delay = Math.min(3000 * Math.pow(2, wsReconnectAttempts), 60000);
             self.logger.info('Reconnecting to WebSocket in ' + (delay/1000) + ' seconds (attempt ' + (wsReconnectAttempts + 1) + '/' + wsMaxReconnectAttempts + ')');
 
+            // Show notification on first disconnect or every 3 attempts
+            if (wsReconnectAttempts === 0) {
+                self.commandRouter.pushToastMessage('warning', self.getI18n('SPOTIFY'), self.getI18n('ERROR_WEBSOCKET_DISCONNECTED'));
+                hasShownConnectionError = true;
+            } else if (wsReconnectAttempts % 3 === 0 && wsReconnectAttempts < wsMaxReconnectAttempts) {
+                self.commandRouter.pushToastMessage('warning', self.getI18n('SPOTIFY'), self.getI18n('ERROR_WEBSOCKET_RECONNECTING'));
+            }
+
             restartTimeout = setTimeout(()=>{
                 wsReconnectAttempts++;
                 if (wsReconnectAttempts >= wsMaxReconnectAttempts) {
                     self.logger.error('Max WebSocket reconnection attempts reached. Restarting go-librespot daemon...');
+                    self.commandRouter.pushToastMessage('error', self.getI18n('SPOTIFY'), self.getI18n('WARNING_MAX_RECONNECT_ATTEMPTS'));
                     self.restartDaemon();
                     wsReconnectAttempts = 0;
                 } else {
@@ -247,6 +258,13 @@ ControllerSpotify.prototype.initializeWsConnection = function () {
 
     ws.on('open', function () {
         self.logger.info('Connection to go-librespot Websocket established');
+
+        // Show success notification if we previously showed an error
+        if (hasShownConnectionError) {
+            self.commandRouter.pushToastMessage('success', self.getI18n('SPOTIFY'), self.getI18n('ERROR_CONNECTION_RESTORED'));
+            hasShownConnectionError = false;
+        }
+
         wsReconnectAttempts = 0; // Reset reconnect counter on successful connection
 
         // Start ping/pong keepalive (every 30 seconds)
@@ -258,6 +276,10 @@ ControllerSpotify.prototype.initializeWsConnection = function () {
                 // Set timeout for pong response (5 seconds)
                 wsPingTimeout = setTimeout(function() {
                     self.logger.error('WebSocket ping timeout - connection dead');
+                    if (!hasShownConnectionError) {
+                        self.commandRouter.pushToastMessage('warning', self.getI18n('SPOTIFY'), self.getI18n('ERROR_WEBSOCKET_DISCONNECTED'));
+                        hasShownConnectionError = true;
+                    }
                     self.cleanupWsConnection();
                     self.goLibrespotDaemonWsConnection('restart');
                 }, 5000);
@@ -529,11 +551,16 @@ ControllerSpotify.prototype.sendSpotifyLocalApiCommand = function (commandPath, 
             if (retryCount < maxRetries) {
                 var delay = Math.pow(2, retryCount) * 1000; // 1s, 2s, 4s
                 self.logger.info('Retrying command in ' + delay + 'ms...');
+                // Show warning on first retry only
+                if (retryCount === 0) {
+                    self.commandRouter.pushToastMessage('warning', self.getI18n('SPOTIFY'), self.getI18n('ERROR_COMMAND_RETRYING'));
+                }
                 setTimeout(() => {
                     self.sendSpotifyLocalApiCommand(commandPath, retryCount + 1);
                 }, delay);
             } else {
                 self.logger.error('Max retries reached for command: ' + commandPath + '. Checking daemon health...');
+                self.commandRouter.pushToastMessage('error', self.getI18n('SPOTIFY'), self.getI18n('ERROR_COMMAND_FAILED'));
                 self.checkDaemonHealth();
             }
         });
@@ -560,11 +587,16 @@ ControllerSpotify.prototype.sendSpotifyLocalApiCommandWithPayload = function (co
             if (retryCount < maxRetries) {
                 var delay = Math.pow(2, retryCount) * 1000; // 1s, 2s, 4s
                 self.logger.info('Retrying command with payload in ' + delay + 'ms...');
+                // Show warning on first retry only
+                if (retryCount === 0) {
+                    self.commandRouter.pushToastMessage('warning', self.getI18n('SPOTIFY'), self.getI18n('ERROR_COMMAND_RETRYING'));
+                }
                 setTimeout(() => {
                     self.sendSpotifyLocalApiCommandWithPayload(commandPath, payload, retryCount + 1);
                 }, delay);
             } else {
                 self.logger.error('Max retries reached for command with payload: ' + commandPath + '. Checking daemon health...');
+                self.commandRouter.pushToastMessage('error', self.getI18n('SPOTIFY'), self.getI18n('ERROR_COMMAND_FAILED'));
                 self.checkDaemonHealth();
             }
         });
@@ -838,15 +870,23 @@ ControllerSpotify.prototype.restartDaemon = function () {
     var self = this;
 
     self.logger.info('Restarting go-librespot daemon due to connection issues');
+    self.commandRouter.pushToastMessage('warning', self.getI18n('SPOTIFY'), self.getI18n('ERROR_DAEMON_RESTARTING'));
+    hasShownDaemonError = true;
+
     self.stopLibrespotDaemon()
         .then(function() {
             return self.startLibrespotDaemon();
         })
         .then(function() {
             self.logger.info('Go-librespot daemon restarted successfully');
+            if (hasShownDaemonError) {
+                self.commandRouter.pushToastMessage('success', self.getI18n('SPOTIFY'), self.getI18n('ERROR_CONNECTION_RESTORED'));
+                hasShownDaemonError = false;
+            }
         })
         .catch(function(error) {
             self.logger.error('Failed to restart go-librespot daemon: ' + error);
+            self.commandRouter.pushToastMessage('error', self.getI18n('SPOTIFY'), self.getI18n('ERROR_DAEMON_UNRESPONSIVE'));
         });
 };
 
@@ -859,12 +899,21 @@ ControllerSpotify.prototype.checkDaemonHealth = function () {
         .timeout(5000)
         .then((results) => {
             self.debugLog('Daemon health check passed');
+            // Clear error flag if health check passes after previous error
+            if (hasShownDaemonError) {
+                self.commandRouter.pushToastMessage('success', self.getI18n('SPOTIFY'), self.getI18n('ERROR_CONNECTION_RESTORED'));
+                hasShownDaemonError = false;
+            }
         })
         .catch((error) => {
             self.logger.error('Daemon health check failed: ' + error);
             // If health check fails, try to reconnect WebSocket
             if (wsConnectionStatus === 'started') {
                 self.logger.info('Attempting to reconnect WebSocket after failed health check');
+                if (!hasShownDaemonError) {
+                    self.commandRouter.pushToastMessage('warning', self.getI18n('SPOTIFY'), self.getI18n('ERROR_DAEMON_UNRESPONSIVE'));
+                    hasShownDaemonError = true;
+                }
                 self.cleanupWsConnection();
                 self.goLibrespotDaemonWsConnection('restart');
             }
@@ -1194,6 +1243,12 @@ ControllerSpotify.prototype.spotifyCheckAccessToken = function () {
                 self.spotifyAccessTokenExpiration = data.body.expiresInSeconds * 1000 + now;
                 self.logger.info('New access token = ' + self.spotifyAccessToken);
                 defer.resolve();
+            })
+            .catch(function (error) {
+                self.logger.error('Failed to refresh access token: ' + error);
+                self.commandRouter.pushToastMessage('error', self.getI18n('SPOTIFY'), self.getI18n('ERROR_TOKEN_REFRESH_FAILED'));
+                self.commandRouter.pushToastMessage('warning', self.getI18n('SPOTIFY'), self.getI18n('ERROR_TOKEN_REAUTHORIZE'));
+                defer.reject(error);
             });
     } else {
         defer.resolve();
