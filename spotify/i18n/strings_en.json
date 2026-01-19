@@ -66,5 +66,17 @@
   "LOGGED_IN_AS": "Logged-in as",
   "CONFIGURATION_SUCCESSFULLY_UPDATED": "Configuration has been successfully updated",
   "CONNECT_DEVICE_ICON_DOC": "Choose which icon will show the device on your Spotify app in Connect Mode",
-  "CONNECT_DEVICE_ICON":"Device Icon"
+  "CONNECT_DEVICE_ICON":"Device Icon",
+  "ERROR_WEBSOCKET_DISCONNECTED": "Connection to Spotify service lost",
+  "ERROR_WEBSOCKET_RECONNECTING": "Attempting to reconnect to Spotify...",
+  "ERROR_WEBSOCKET_FAILED": "Failed to connect to Spotify service",
+  "ERROR_DAEMON_UNRESPONSIVE": "Spotify service not responding",
+  "ERROR_DAEMON_RESTARTING": "Restarting Spotify service...",
+  "ERROR_COMMAND_FAILED": "Playback command failed",
+  "ERROR_COMMAND_RETRYING": "Retrying playback command...",
+  "ERROR_TOKEN_REFRESH_FAILED": "Spotify authorization expired",
+  "ERROR_TOKEN_REAUTHORIZE": "Please re-authorize your Spotify account",
+  "ERROR_PLAYBACK_FAILED": "Failed to start playback",
+  "ERROR_CONNECTION_RESTORED": "Spotify connection restored",
+  "WARNING_MAX_RECONNECT_ATTEMPTS": "Connection unstable, restarting service..."
 }
